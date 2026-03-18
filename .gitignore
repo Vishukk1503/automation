@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+input/
+central/
+archive/
+backup/
+logs/
