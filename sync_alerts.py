@@ -124,15 +124,13 @@ def rollback(backup_path: Path, logger: logging.Logger):
     logger.warning(f"ROLLBACK complete — master.csv restored from {backup_path}")
 
 
-def get_input_file(logger: logging.Logger) -> Path:
+def get_input_files(logger: logging.Logger) -> list[Path]:
     files = sorted(INPUT_DIR.glob("*.csv"))
     if not files:
         logger.info("No input CSV found in input/ — nothing to do.")
         sys.exit(0)
-    if len(files) > 1:
-        logger.warning(f"Multiple CSVs found — processing first only: {files[0].name}")
-    logger.info(f"Input file: {files[0].name}")
-    return files[0]
+    logger.info(f"Found {len(files)} input file(s): {', '.join(f.name for f in files)}")
+    return files
 
 
 def load_input(path: Path, logger: logging.Logger) -> pd.DataFrame:
@@ -232,16 +230,30 @@ def main():
     logger.info(f"SYNC RUN STARTED  {run_ts}")
     logger.info("=" * 60)
 
-    backup_path = None
-    input_file  = None
+    backup_path   = None
+    input_files  = []
 
     try:
-        input_file  = get_input_file(logger)
+        input_files = get_input_files(logger)
         central     = load_central(logger)
         backup_path = backup_central(run_ts, logger)
-        incoming    = load_input(input_file, logger)
 
-        result, stats = sync(central, incoming, logger)
+        # Accumulate totals across all files
+        total_stats = {"new": 0, "updated": 0, "skipped": 0, "skipped_reopen": 0}
+
+        for input_file in input_files:
+            logger.info("")
+            logger.info(f"── Processing: {input_file.name} ──")
+            incoming = load_input(input_file, logger)
+            central, stats = sync(central, incoming, logger)
+
+            for k in total_stats:
+                total_stats[k] += stats[k]
+
+            logger.info(f"  ├ New: {stats['new']:,}  Updated: {stats['updated']:,}  "
+                        f"Skipped: {stats['skipped']:,}  Reopen blocked: {stats['skipped_reopen']:,}")
+
+            archive_input(input_file, run_ts, logger)
 
         # Restore original header casing before writing
         if ORIGINAL_HEADERS:
@@ -250,20 +262,18 @@ def main():
                 low = orig.strip().lower()
                 mapped = COL_MAP.get(low, low)
                 norm_to_orig[mapped] = orig
-            result.rename(columns=norm_to_orig, inplace=True)
+            central.rename(columns=norm_to_orig, inplace=True)
 
         # Write UTF-8 with BOM so Excel / PowerBI opens cleanly
-        result.to_csv(CENTRAL, index=False, encoding="utf-8-sig")
-        logger.info(f"Central CSV updated: {len(result):,} total rows")
-
-        # Archive input
-        archive_input(input_file, run_ts, logger)
+        central.to_csv(CENTRAL, index=False, encoding="utf-8-sig")
+        logger.info(f"Central CSV updated: {len(central):,} total rows")
 
         logger.info("-" * 60)
-        logger.info(f"  New alerts added   : {stats['new']:,}")
-        logger.info(f"  Rows updated O→C   : {stats['updated']:,}")
-        logger.info(f"  Rows skipped       : {stats['skipped']:,}")
-        logger.info(f"  Skipped (reopen)   : {stats['skipped_reopen']:,}")
+        logger.info(f"  TOTALS across {len(input_files)} file(s):")
+        logger.info(f"  New alerts added   : {total_stats['new']:,}")
+        logger.info(f"  Rows updated O→C   : {total_stats['updated']:,}")
+        logger.info(f"  Rows skipped       : {total_stats['skipped']:,}")
+        logger.info(f"  Skipped (reopen)   : {total_stats['skipped_reopen']:,}")
         logger.info("-" * 60)
         logger.info("SYNC RUN COMPLETE ✓")
 
