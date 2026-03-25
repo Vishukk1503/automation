@@ -56,11 +56,37 @@ ORIGINAL_HEADERS: list[str] = []
 
 # Normalise incoming column names (lowercase strip) to internal names
 COL_MAP = {
-    "alert_id"    : "alert_id",
-    "alert id"    : "alert_id",
-    "open/closed" : "open_closed",
-    "open_closed" : "open_closed",
-    "openclosed"  : "open_closed",
+    "alert_id"                    : "alert_id",
+    "alert id"                    : "alert_id",
+    "alert_date"                  : "alert_date",
+    "alert date"                  : "alert_date",
+    "message_key/party_key"       : "message_key/party_key",
+    "message key/party key"       : "message_key/party_key",
+    "message_key_party_key"       : "message_key/party_key",
+    "parent_entity_id"            : "parent_entity_id",
+    "parent entity id"            : "parent_entity_id",
+    "job_name"                    : "job_name",
+    "job name"                    : "job_name",
+    "alert_type"                  : "alert_type",
+    "alert type"                  : "alert_type",
+    "search_definition"           : "search_definition",
+    "search definition"           : "search_definition",
+    "source_system_id"            : "source_system_id",
+    "source system id"            : "source_system_id",
+    "bu"                          : "bu",
+    "user_name"                   : "user_name",
+    "user name"                   : "user_name",
+    "open/closed"                 : "open_closed",
+    "open_closed"                 : "open_closed",
+    "openclosed"                  : "open_closed",
+    "alert_close_date"            : "alert_close_date",
+    "alert close date"            : "alert_close_date",
+    "previous_eligibility_status" : "previous_eligibility_status",
+    "previous eligibility status" : "previous_eligibility_status",
+    "alert_step"                  : "alert_step",
+    "alert step"                  : "alert_step",
+    "has_rfi"                     : "has_rfi",
+    "has rfi"                     : "has_rfi",
 }
 
 
@@ -85,9 +111,9 @@ def setup_logging(run_ts: str) -> logging.Logger:
 
 
 def read_csv_safely(path, **kwargs) -> pd.DataFrame:
-    """Try UTF-8 first, fall back to cp1252 (Windows encoding)."""
+    """Try UTF-8-sig (strips BOM) first, fall back to cp1252 (Windows encoding)."""
     try:
-        return pd.read_csv(path, encoding="utf-8", **kwargs)
+        return pd.read_csv(path, encoding="utf-8-sig", **kwargs)
     except UnicodeDecodeError:
         return pd.read_csv(path, encoding="cp1252", **kwargs)
 
@@ -124,20 +150,45 @@ def rollback(backup_path: Path, logger: logging.Logger):
     logger.warning(f"ROLLBACK complete — master.csv restored from {backup_path}")
 
 
+# Expected input file prefixes (controls processing order)
+FILE_PREFIX_NEW      = "01_"   # New alerts  (Report 1)
+FILE_PREFIX_CLOSURES = "02_"   # Closures    (Report 2)
+
+
 def get_input_files(logger: logging.Logger) -> list[Path]:
     files = sorted(INPUT_DIR.glob("*.csv"))
     if not files:
         logger.info("No input CSV found in input/ — nothing to do.")
         sys.exit(0)
+    # When multiple files, enforce 01_/02_ naming to guarantee processing order
+    if len(files) > 1:
+        for f in files:
+            if not (f.name.startswith(FILE_PREFIX_NEW) or f.name.startswith(FILE_PREFIX_CLOSURES)):
+                logger.warning(
+                    f"File '{f.name}' does not start with '{FILE_PREFIX_NEW}' or '{FILE_PREFIX_CLOSURES}'. "
+                    f"Rename to 01_<name>.csv (new alerts) or 02_<name>.csv (closures)."
+                )
+                raise ValueError(
+                    f"Invalid file name '{f.name}' — when dropping multiple files, "
+                    f"prefix with '01_' (new alerts) or '02_' (closures)"
+                )
     logger.info(f"Found {len(files)} input file(s): {', '.join(f.name for f in files)}")
     return files
 
 
-def load_input(path: Path, logger: logging.Logger) -> pd.DataFrame:
+def load_input(path: Path, logger: logging.Logger, central_cols: set = None) -> pd.DataFrame:
     df = read_csv_safely(path, dtype=str).fillna("")
     df = normalise_columns(df)
     if ALERT_ID_COL not in df.columns:
         raise ValueError(f"Input CSV missing required column '{ALERT_ID_COL}'")
+    # Warn about unrecognised columns
+    if central_cols:
+        extra = set(df.columns) - central_cols
+        if extra:
+            logger.warning(f"Input has columns not in master (will be ignored): {extra}")
+        missing = central_cols - set(df.columns) - {ALERT_ID_COL}
+        if missing:
+            logger.warning(f"Input is missing master columns (will be blank): {missing}")
     before = len(df)
     df.drop_duplicates(subset=[ALERT_ID_COL], keep="first", inplace=True)
     dupes = before - len(df)
@@ -197,21 +248,15 @@ def sync(central: pd.DataFrame, incoming: pd.DataFrame,
         logger.info("No changes to apply.")
         return central, stats
 
-    # Ensure columns align — add any missing cols to the existing central df
-    incoming_cols = incoming.columns.tolist()
-    for col in incoming_cols:
-        if col not in central.columns:
-            central[col] = ""
-
     # Remove rows that need to be replaced (updated) — new rows won't be in central
     ids_to_remove = set(rows_to_replace.keys()) - set(k for k, _ in [(k, v) for k, v in rows_to_replace.items() if k not in central_idx.index])
     # More precisely: only remove IDs that already existed in central
     existing_replace_ids = {aid for aid in rows_to_replace if aid in central_idx.index}
     central = central[~central[ALERT_ID_COL].isin(existing_replace_ids)]
 
-    # Build new rows dataframe (preserves central column order for new rows)
+    # Build new rows dataframe — use ONLY central's columns (drop any extras from input)
     new_rows = pd.DataFrame(rows_to_replace.values())
-    # Align columns to central
+    # Fill any missing columns with "" and select exactly central's columns
     for col in central.columns:
         if col not in new_rows.columns:
             new_rows[col] = ""
@@ -240,11 +285,12 @@ def main():
 
         # Accumulate totals across all files
         total_stats = {"new": 0, "updated": 0, "skipped": 0, "skipped_reopen": 0}
+        central_cols = set(central.columns)
 
         for input_file in input_files:
             logger.info("")
             logger.info(f"── Processing: {input_file.name} ──")
-            incoming = load_input(input_file, logger)
+            incoming = load_input(input_file, logger, central_cols)
             central, stats = sync(central, incoming, logger)
 
             for k in total_stats:
