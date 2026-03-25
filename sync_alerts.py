@@ -211,7 +211,6 @@ def sync(central: pd.DataFrame, incoming: pd.DataFrame,
     stats = {"new": 0, "updated": 0, "skipped": 0, "skipped_reopen": 0}
 
     central_idx = central.set_index(ALERT_ID_COL)
-    updated_ids = set()
     rows_to_replace = {}
 
     for _, row in incoming.iterrows():
@@ -219,7 +218,6 @@ def sync(central: pd.DataFrame, incoming: pd.DataFrame,
 
         if aid not in central_idx.index:
             # Brand new alert — will be appended
-            updated_ids.add(aid)
             rows_to_replace[aid] = row
             stats["new"] += 1
             logger.debug(f"  NEW       {aid}")
@@ -248,9 +246,7 @@ def sync(central: pd.DataFrame, incoming: pd.DataFrame,
         logger.info("No changes to apply.")
         return central, stats
 
-    # Remove rows that need to be replaced (updated) — new rows won't be in central
-    ids_to_remove = set(rows_to_replace.keys()) - set(k for k, _ in [(k, v) for k, v in rows_to_replace.items() if k not in central_idx.index])
-    # More precisely: only remove IDs that already existed in central
+    # Remove rows that will be replaced (Open → Closed updates)
     existing_replace_ids = {aid for aid in rows_to_replace if aid in central_idx.index}
     central = central[~central[ALERT_ID_COL].isin(existing_replace_ids)]
 
